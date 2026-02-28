@@ -135,7 +135,7 @@ export default function SearchBar() {
             {/* Results dropdown */}
             {isOpen && results.length > 0 && (
                 <ul
-                    className="absolute z-50 w-full mt-2 bg-surface border border-border rounded-xl shadow-lg overflow-hidden"
+                    className="absolute z-50 w-full mt-2 bg-surface border border-border rounded-xl shadow-lg overflow-y-auto max-h-96"
                     role="listbox"
                     id="search-results"
                 >

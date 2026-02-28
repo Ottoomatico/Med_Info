@@ -3,9 +3,17 @@ import { createServerClient } from '@/lib/supabase/server';
 import type { SearchResult } from '@/lib/types';
 
 /**
+ * Normalize accented characters for comparison
+ */
+function normalizeAccents(str: string): string {
+    return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+/**
  * GET /api/search?q=<query>
- * Full-text search on diseases + symptom name matching.
- * Returns up to 10 results.
+ * Searches diseases by name (FTS + ilike) AND by symptom name.
+ * When a symptom matches, returns ALL diseases linked to that symptom.
+ * Supports accent-insensitive matching (e.g. "fievre" matches "Fièvre").
  */
 export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
@@ -17,48 +25,54 @@ export async function GET(request: Request) {
 
     const supabase = createServerClient();
     const results: SearchResult[] = [];
+    const seenDiseaseIds = new Set<string>();
+    const normalizedQuery = normalizeAccents(query.toLowerCase());
 
-    // Full-text search on diseases using tsvector
+    // 1. Full-text search on diseases using tsvector
     const tsQuery = query
         .split(/\s+/)
         .filter(Boolean)
         .map((word) => `${word}:*`)
         .join(' & ');
 
-    const { data: diseaseResults } = await supabase
+    const { data: ftsResults } = await supabase
         .from('diseases')
         .select('id, name, slug, description')
         .textSearch('search_vector', tsQuery, { type: 'plain', config: 'french' })
-        .limit(6);
+        .limit(10);
 
-    if (diseaseResults) {
-        for (const d of diseaseResults) {
-            results.push({
-                id: d.id,
-                name: d.name,
-                slug: d.slug,
-                description: d.description.substring(0, 100),
-                type: 'disease',
-            });
+    if (ftsResults) {
+        for (const d of ftsResults) {
+            if (!seenDiseaseIds.has(d.id)) {
+                seenDiseaseIds.add(d.id);
+                results.push({
+                    id: d.id,
+                    name: d.name,
+                    slug: d.slug,
+                    description: d.description.substring(0, 120),
+                    type: 'disease',
+                });
+            }
         }
     }
 
-    // If few FTS results, try ilike fallback for partial matching
-    if (results.length < 3) {
+    // 2. ilike fallback on disease name for partial matching
+    if (results.length < 5) {
         const { data: fallback } = await supabase
             .from('diseases')
             .select('id, name, slug, description')
             .ilike('name', `%${query}%`)
-            .limit(4);
+            .limit(8);
 
         if (fallback) {
             for (const d of fallback) {
-                if (!results.find((r) => r.id === d.id)) {
+                if (!seenDiseaseIds.has(d.id)) {
+                    seenDiseaseIds.add(d.id);
                     results.push({
                         id: d.id,
                         name: d.name,
                         slug: d.slug,
-                        description: d.description.substring(0, 100),
+                        description: d.description.substring(0, 120),
                         type: 'disease',
                     });
                 }
@@ -66,41 +80,58 @@ export async function GET(request: Request) {
         }
     }
 
-    // Search symptoms by name (to link to diseases that have them)
-    const { data: symptomResults } = await supabase
+    // 3. Search symptoms by name (accent-insensitive) — return ALL diseases linked to matching symptoms
+    // First, get ALL symptoms and filter client-side for accent-insensitive matching
+    const { data: allSymptoms } = await supabase
         .from('symptoms')
-        .select('id, name')
-        .ilike('name', `%${query}%`)
-        .limit(4);
+        .select('id, name');
 
-    if (symptomResults) {
-        for (const s of symptomResults) {
-            // Find diseases linked to this symptom
-            const { data: linked } = await supabase
-                .from('disease_symptoms')
-                .select('disease_id')
-                .eq('symptom_id', s.id)
-                .limit(1);
+    const matchingSymptoms = allSymptoms?.filter((s) =>
+        normalizeAccents(s.name.toLowerCase()).includes(normalizedQuery)
+    ) || [];
 
-            if (linked && linked.length > 0) {
-                const { data: disease } = await supabase
+    if (matchingSymptoms.length > 0) {
+        const symptomIds = matchingSymptoms.map((s) => s.id);
+        const symptomNames = new Map(matchingSymptoms.map((s) => [s.id, s.name]));
+
+        // Get all disease-symptom links for matching symptoms
+        const { data: links } = await supabase
+            .from('disease_symptoms')
+            .select('disease_id, symptom_id')
+            .in('symptom_id', symptomIds);
+
+        if (links && links.length > 0) {
+            // Get unique disease IDs not already in results
+            const newDiseaseIds = [...new Set(links.map((l) => l.disease_id))]
+                .filter((id) => !seenDiseaseIds.has(id));
+
+            if (newDiseaseIds.length > 0) {
+                const { data: linkedDiseases } = await supabase
                     .from('diseases')
                     .select('id, name, slug, description')
-                    .eq('id', linked[0].disease_id)
-                    .single();
+                    .in('id', newDiseaseIds)
+                    .order('name')
+                    .limit(25);
 
-                if (disease && !results.find((r) => r.id === disease.id)) {
-                    results.push({
-                        id: disease.id,
-                        name: disease.name,
-                        slug: disease.slug,
-                        description: `Symptome : ${s.name}`,
-                        type: 'symptom',
-                    });
+                if (linkedDiseases) {
+                    for (const d of linkedDiseases) {
+                        // Find which symptom linked this disease
+                        const link = links.find((l) => l.disease_id === d.id);
+                        const symptomName = link ? symptomNames.get(link.symptom_id) : '';
+
+                        seenDiseaseIds.add(d.id);
+                        results.push({
+                            id: d.id,
+                            name: d.name,
+                            slug: d.slug,
+                            description: symptomName ? `Symptôme : ${symptomName}` : d.description.substring(0, 120),
+                            type: 'symptom',
+                        });
+                    }
                 }
             }
         }
     }
 
-    return NextResponse.json({ results: results.slice(0, 10) });
+    return NextResponse.json({ results: results.slice(0, 30) });
 }
